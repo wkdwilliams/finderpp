@@ -22,8 +22,8 @@ enum FileSystemService {
     }
 
     /// Directory-only path completions for the location bar, keyed off the
-    /// partial path's last component (e.g. `"/Users/lewy/Doc"` → entries in
-    /// `/Users/lewy` starting with "Doc"). Hidden entries are excluded
+    /// partial path's last component (e.g. `"/Users/sam/Doc"` → entries in
+    /// `/Users/sam` starting with "Doc"). Hidden entries are excluded
     /// unless the partial component itself starts with `.`, matching shell
     /// tab-completion convention. Returns full paths, sorted naturally.
     static func directoryCompletions(for partialPath: String, limit: Int = 8) -> [String] {
