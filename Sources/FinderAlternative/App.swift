@@ -33,8 +33,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// source file living at `Resources/icon.png` — SwiftPM's `.copy` rule
     /// flattens it to the bundle's root (confirmed by inspecting the built
     /// `.bundle`), it doesn't preserve the source-relative subdirectory.
+    ///
+    /// **Only reached for the unbundled `swift run` dev workflow.** A real
+    /// packaged release `.app` sets `CFBundleIconFile` in `Info.plist`
+    /// instead and needs no runtime code at all — and *must* skip
+    /// `Bundle.module` entirely: that accessor's own generated lookup
+    /// requires a loose `<TargetName>.bundle` folder sitting at the `.app`
+    /// root (sibling to `Contents`), and *anything* there breaks
+    /// `codesign`'s resource-sealing (confirmed via `codesign --verify`:
+    /// "code has no resources but signature indicates they must be
+    /// present") — which is exactly what surfaces to a user as "'Finder++'
+    /// is damaged and can't be opened" under Gatekeeper, not just an
+    /// unsigned-developer warning. `Bundle.module` is also a crashing
+    /// `fatalError` if unresolved, so this guard must run *before* ever
+    /// touching it, not wrap it in a `do/catch`.
     @MainActor
     private func applyCustomAppIcon() {
+        guard Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") == nil else { return }
         guard let url = Bundle.module.url(forResource: "icon", withExtension: "png"),
               let image = NSImage(contentsOf: url) else { return }
         NSApp.applicationIconImage = image
