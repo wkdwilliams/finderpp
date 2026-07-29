@@ -13,6 +13,10 @@ struct IconGridView: View {
     /// for why this replaces a competing `TapGesture(count: 2)`.
     @State private var lastClickedID: FileItem.ID?
     @State private var lastClickTime: Date = .distantPast
+    /// Cell hit-rects for `GridDragMonitor`, recorded via
+    /// `.onGeometryChange` below — a plain class (not `ObservableObject`)
+    /// so per-scroll-frame writes never invalidate the view tree.
+    @State private var frameRegistry = CellFrameRegistry()
     /// See `AppSettings`'s doc comment for why this is `.environmentObject`
     /// rather than `@AppStorage` directly.
     private var viewerScale: Double { settings.fileViewerScale }
@@ -44,6 +48,16 @@ struct IconGridView: View {
             LazyVGrid(columns: columns, spacing: 12 * viewerScale) {
                 ForEach(viewModel.filteredItems) { item in
                     cell(for: item)
+                        .onGeometryChange(for: CGRect.self) { proxy in
+                            proxy.frame(in: .named("gridSpace"))
+                        } action: { frame in
+                            frameRegistry.frames[item.id] = frame
+                        }
+                        .onDisappear {
+                            // LazyVGrid recycles offscreen cells — drop
+                            // their rects so a stale one can't be hit.
+                            frameRegistry.frames.removeValue(forKey: item.id)
+                        }
                         .gesture(singleClickGesture(for: item))
                         .contextMenu {
                             fileContextMenu(
@@ -60,9 +74,29 @@ struct IconGridView: View {
             }
             .padding(12)
         }
+        .coordinateSpace(name: "gridSpace")
+        // Outgoing drag — see `GridDragMonitor` for the mechanism and why
+        // it can never interfere with the tap-gesture selection above.
+        .background(GridDragMonitor(
+            registry: frameRegistry,
+            payloadURLs: { hitID in dragPayloadURLs(hitID: hitID, viewModel: viewModel) },
+            selectOnPress: { hitID in
+                // Finder parity: pressing an unselected cell selects just
+                // it immediately (at mouse-down, not release — the
+                // TapGesture's on-release selection alone reads as lag).
+                if !viewModel.selection.contains(hitID) {
+                    viewModel.selection = [hitID]
+                    anchorID = hitID
+                }
+            },
+            canDrag: { renamingID == nil && !coordinator.isBlocking }
+        ))
+        .onChange(of: viewModel.currentDirectory) {
+            frameRegistry.clear()
+        }
         // Grid-level drop target — drops into currentDirectory regardless of
-        // which cell they land on. Incoming drops (from Finder) still work;
-        // only outgoing drag was removed — see `cell`'s doc comment.
+        // which cell they land on. Incoming drops (from Finder or the other
+        // pane's outgoing drag) work via this.
         .dropDestination(for: URL.self) { urls, _ in
             performDrop(urls: urls, destination: viewModel.currentDirectory, viewModel: viewModel, coordinator: coordinator)
             return true
@@ -167,19 +201,16 @@ struct IconGridView: View {
         viewModel.selection = Set(all[range].map(\.id))
     }
 
-    /// Outgoing drag (`.draggable`) used to be attached here, gated on a
-    /// delayed "armed" set to avoid intercepting plain taps. Removed
-    /// entirely: `.draggable` intercepts `mouseDown` to watch for a drag
-    /// threshold, and no amount of delay/debounce tuning around *when* it
-    /// attaches eliminated cases where a still- or newly-armed cell's tap
-    /// got eaten instead of registering as a selection (confirmed via
-    /// repeated live repro — e.g. select A, select B, tap back on A
-    /// shortly after). Pane-to-pane transfer now only works via Copy/Paste
-    /// (⌘C/⌘V/⌥⌘V from `FileContextMenu`) — incoming drops (from Finder, or
-    /// any future outgoing-drag source) still work via `.dropDestination`
-    /// above. See `CLAUDE.md` for the full history; an AppKit-interop
-    /// `NSViewRepresentable` grid would be the real fix if outgoing drag
-    /// is needed again.
+    /// Outgoing drag deliberately does NOT live here on the cell. SwiftUI
+    /// `.draggable` was attached here (gated on a delayed "armed" set) and
+    /// removed three times over — it intercepts `mouseDown` to watch for a
+    /// drag threshold and ate plain selection taps (repro: select A,
+    /// select B, tap back on A shortly after), and no delay/debounce
+    /// tuning ever fully fixed it. Outgoing drag now works via
+    /// `GridDragMonitor` (attached at the ScrollView level above), a
+    /// passive event monitor that never consumes events and so can't
+    /// interfere with the tap gestures — see that type's doc comment. Do
+    /// not reintroduce `.draggable`/`.onDrag` here.
     private func cell(for item: FileItem) -> some View {
         VStack(spacing: 3 * viewerScale) {
             Image(nsImage: NSWorkspace.shared.icon(forFile: item.url.path))

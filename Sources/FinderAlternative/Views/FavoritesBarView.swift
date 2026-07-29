@@ -50,13 +50,21 @@ struct FavoritesBarView: View {
         }
     }
 
+    /// Labels never wrap — a narrow window truncates them with an ellipsis
+    /// ("Downlo…") instead of breaking into multiple lines ("Dow nloa ds"),
+    /// which both looked bad and made the bar's height jump around as the
+    /// window resized. `.help` shows the full name on hover for anything
+    /// truncated.
     private func locationButton(name: String, systemImage: String, url: URL) -> some View {
         Button {
             onSelect(url)
         } label: {
             Label(name, systemImage: systemImage)
+                .lineLimit(1)
+                .truncationMode(.tail)
         }
         .buttonStyle(.plain)
+        .help(name)
     }
 
     private func refreshVolumes() {

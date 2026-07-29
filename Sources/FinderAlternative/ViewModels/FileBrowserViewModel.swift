@@ -74,9 +74,29 @@ final class FileBrowserViewModel: ObservableObject {
     /// confirmation before `FileOperationCoordinator.deletePermanently` runs.
     @Published var pendingPermanentDelete: [URL] = []
 
+    // `nonisolated(unsafe)` solely so the nonisolated `deinit` can remove
+    // it — it's only ever written once, in `init`.
+    private nonisolated(unsafe) var dropCompletionObserver: (any NSObjectProtocol)?
+
     init(startingAt url: URL = FileManager.default.homeDirectoryForCurrentUser) {
         self.currentDirectory = url
         reload()
+        // A pane-to-pane drag changes both panes' directories, but the drop
+        // completion handler only knows the destination pane — so every
+        // pane reloads on this notification instead (see `performDrop`).
+        dropCompletionObserver = NotificationCenter.default.addObserver(
+            forName: .fileDropOperationDidComplete,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reload() }
+        }
+    }
+
+    deinit {
+        if let dropCompletionObserver {
+            NotificationCenter.default.removeObserver(dropCompletionObserver)
+        }
     }
 
     func reload() {

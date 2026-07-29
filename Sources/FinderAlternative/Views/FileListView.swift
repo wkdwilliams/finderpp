@@ -50,6 +50,25 @@ struct FileListView: View {
             }
         }
         .controlSize(.small)
+        // Outgoing drag — see `TableDragBridge` for the mechanism and the
+        // history of why it must never touch the click path.
+        .background(TableDragBridge(
+            urlForRow: { row in
+                viewModel.filteredItems.indices.contains(row) ? viewModel.filteredItems[row].url : nil
+            },
+            canDrag: { renamingID == nil && !coordinator.isBlocking },
+            selectRow: { row in
+                guard viewModel.filteredItems.indices.contains(row) else { return }
+                let id = viewModel.filteredItems[row].id
+                // Only plain presses on rows OUTSIDE the current selection —
+                // pressing inside a multi-selection must not collapse it
+                // (that's deferred to mouse-up natively, so it can be
+                // dragged whole).
+                if !viewModel.selection.contains(id) {
+                    viewModel.selection = [id]
+                }
+            }
+        ))
         .contextMenu(forSelectionType: FileItem.ID.self) { ids in
             fileContextMenu(for: ids, viewModel: viewModel, coordinator: coordinator) { item in
                 beginRenaming(item)
@@ -136,19 +155,16 @@ struct FileListView: View {
         )
     }
 
-    /// Outgoing drag (`.draggable`) used to be attached here, gated on a
-    /// delayed "armed" set to avoid intercepting plain clicks. Removed
-    /// entirely: `.draggable` intercepts `mouseDown` to watch for a drag
-    /// threshold, and no amount of delay/debounce tuning around *when* it
-    /// attaches eliminated cases where a still- or newly-armed row's click
-    /// got eaten instead of registering as a selection (confirmed via
-    /// repeated live repro — e.g. select A, select B, click back on A
-    /// shortly after). Pane-to-pane transfer now only works via Copy/Paste
-    /// (⌘C/⌘V/⌥⌘V from `FileContextMenu`) — incoming drops (from Finder, or
-    /// any future outgoing-drag source) still work via `.dropDestination`
-    /// below. See `CLAUDE.md` for the full history; an AppKit-interop
-    /// `NSViewRepresentable` table would be the real fix if outgoing drag
-    /// is needed again.
+    /// Outgoing drag deliberately does NOT live here on the cell content.
+    /// SwiftUI `.draggable` was attached here (gated on a delayed "armed"
+    /// set) and removed three times over — it intercepts `mouseDown` to
+    /// watch for a drag threshold and ate plain selection clicks (repro:
+    /// select A, select B, click back on A shortly after), and no
+    /// delay/debounce tuning ever fully fixed it. Outgoing drag now works
+    /// via `TableDragBridge` (attached at the `Table` level above), which
+    /// interposes the backing `NSTableView`'s dataSource so AppKit's own
+    /// native click-vs-drag machinery runs instead — see that type's doc
+    /// comment. Do not reintroduce `.draggable`/`.onDrag` here.
     @ViewBuilder
     private func nameCell(for item: FileItem) -> some View {
         if renamingID == item.id {
