@@ -3,7 +3,7 @@ import SwiftUI
 
 /// Outgoing drag for `FileListView`, WITHOUT touching the click path.
 ///
-/// History (the constraint this design exists to satisfy): SwiftUI
+/// History (the constraints this design exists to satisfy): SwiftUI
 /// `.draggable` on Table rows was removed three times over — it intercepts
 /// `mouseDown` to watch for a drag threshold and eats plain selection
 /// clicks, and no delay/debounce tuning ever fully fixed it. A passive
@@ -13,20 +13,33 @@ import SwiftUI
 /// them, and starting a drag session mid-loop can wedge the table's click
 /// tracking (the same bug through a different door).
 ///
-/// This instead finds the `NSTableView` that SwiftUI's `Table` is backed by
-/// (empirically confirmed — this app has observed "reentrant operation in
-/// its NSTableView delegate" AppKit warnings from that very table) and
-/// wraps its dataSource in a forwarding proxy that adds
-/// `tableView(_:pasteboardWriterForRow:)`. AppKit then runs its own native
-/// click-vs-drag disambiguation — the exact machinery Finder uses: the drag
-/// threshold never eats clicks, pressing a selected row drags the whole
-/// selection, deselection is deferred to mouse-up, drag images are native
-/// row snapshots. Zero event-handling code on our side.
+/// A second constraint, learned the hard way: the first working version of
+/// this bridge wrapped the backing table's `dataSource` in a forwarding
+/// proxy that added `tableView(_:pasteboardWriterForRow:)` — and that
+/// silently killed `.contextMenu(forSelectionType:)` (right-click showed no
+/// menu at all, list view only). Empirically (FA_DRAG_DEBUG selector
+/// logging), SwiftUI consults NO dataSource method during a right-click, so
+/// a perfectly-forwarding proxy can't help: its menu path checks the
+/// dataSource's *identity* — it must find SwiftUI's own
+/// `AppKitOutlineTableCoordinator` there, and any foreign object (however
+/// transparent) makes it bail. Confirmed by A/B with `FA_NO_DRAG`: proxy
+/// installed → no menu; proxy skipped → menu fine.
+///
+/// So instead of replacing the dataSource, this adds the pasteboard-writer
+/// methods directly onto SwiftUI's own coordinator *class*
+/// (`class_addMethod`), keeping the dataSource object untouched. Per-table
+/// routing (two panes = two tables sharing that class) goes through a
+/// `TableDragConfig` associated object on each table view. AppKit then runs
+/// its own native click-vs-drag disambiguation — the exact machinery Finder
+/// uses: the drag threshold never eats clicks, pressing a selected row
+/// drags the whole selection, deselection is deferred to mouse-up, drag
+/// images are native row snapshots. Zero event-handling code on our side.
 ///
 /// Fail-safe property: if SwiftUI's internals ever change such that the
-/// backing table can't be found or the proxy gets permanently reset, the
-/// worst case is "drag doesn't start" — clicks can never be affected,
-/// because nothing here sees, gates, or consumes a single mouse event.
+/// backing table or its coordinator class can't be found, the worst case is
+/// "drag doesn't start" — clicks and menus can never be affected, because
+/// nothing here sees, gates, or consumes a single mouse event, and the
+/// added methods return nil for any table without a config.
 struct TableDragBridge: NSViewRepresentable {
     var urlForRow: @MainActor (Int) -> URL?
     var canDrag: @MainActor () -> Bool
@@ -56,8 +69,8 @@ struct TableDragBridge: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        context.coordinator.proxy.urlForRow = urlForRow
-        context.coordinator.proxy.canDrag = canDrag
+        context.coordinator.config.urlForRow = urlForRow
+        context.coordinator.config.canDrag = canDrag
         context.coordinator.selectRow = selectRow
         context.coordinator.canDrag = canDrag
         context.coordinator.reassert(from: nsView)
@@ -71,11 +84,12 @@ struct TableDragBridge: NSViewRepresentable {
 
     @MainActor
     final class Coordinator {
-        let proxy = DragDataSourceProxy()
+        let config = TableDragConfig()
         var selectRow: @MainActor (Int) -> Void = { _ in }
         var canDrag: @MainActor () -> Bool = { false }
         private weak var tableView: NSTableView?
         private var pressMonitor: Any?
+        private var activated = false
 
         /// Restores press-time selection highlight (see `selectRow`'s doc
         /// comment). Observes only `leftMouseDown` and always returns the
@@ -112,12 +126,11 @@ struct TableDragBridge: NSViewRepresentable {
             selectRow(row)
         }
 
-        /// Installs (or re-installs, if SwiftUI replaced the dataSource
-        /// during one of its own updates) the interposing proxy. Called on
-        /// every SwiftUI update — a missed window just means drag is inert
-        /// until the next update, never that clicks break.
+        /// One-time (per table) activation: attach the routing config,
+        /// extend the coordinator class, and refresh the table's cached
+        /// "does my dataSource respond to drag methods?" flags.
         ///
-        /// The actual mutation (swapping `dataSource`, which makes
+        /// The actual mutation (re-setting `dataSource`, which makes
         /// NSTableView re-query its data) is deferred to the next run-loop
         /// turn: `reassert` is typically called from `updateNSView`, i.e.
         /// *inside* SwiftUI's update transaction, and mutating the table
@@ -141,20 +154,26 @@ struct TableDragBridge: NSViewRepresentable {
                 return
             }
             installPressMonitor()
-            guard tableView.dataSource !== proxy else { return }
-            guard let original = tableView.dataSource, !(original is DragDataSourceProxy) else { return }
-            DispatchQueue.main.async { [proxy, weak tableView] in
-                guard let tableView else { return }
-                // Re-check: SwiftUI may have swapped the dataSource again
-                // between the update pass and this deferred turn.
-                guard tableView.dataSource !== proxy else { return }
-                guard let original = tableView.dataSource, !(original is DragDataSourceProxy) else { return }
-                proxy.original = original
-                tableView.dataSource = proxy
-                tableView.setDraggingSourceOperationMask([.copy, .move, .generic], forLocal: true)
-                tableView.setDraggingSourceOperationMask([.copy, .move, .generic], forLocal: false)
-                Self.allowRowDragging(on: tableView)
-                if dragDebug { NSLog("FA_DRAG: proxy installed over %@", NSStringFromClass(type(of: original))) }
+            guard !activated, tableView.dataSource != nil else { return }
+            activated = true
+            DispatchQueue.main.async { [config, weak tableView] in
+                MainActor.assumeIsolated {
+                    guard let tableView, let dataSource = tableView.dataSource else { return }
+                    objc_setAssociatedObject(tableView, &tableDragConfigKey, config, .OBJC_ASSOCIATION_RETAIN)
+                    TableDragConfig.installWriterMethods(onClassOf: dataSource)
+                    // NSTableView caches its dataSource's respondsToSelector
+                    // answers at assignment time — the drag methods were
+                    // added to the class *after* SwiftUI set the dataSource,
+                    // so force a re-cache or drag initiation never consults
+                    // them. (A plain self-reassignment is short-circuited;
+                    // the nil round-trip is not.)
+                    tableView.dataSource = nil
+                    tableView.dataSource = dataSource
+                    tableView.setDraggingSourceOperationMask([.copy, .move, .generic], forLocal: true)
+                    tableView.setDraggingSourceOperationMask([.copy, .move, .generic], forLocal: false)
+                    Self.allowRowDragging(on: tableView)
+                    if dragDebug { NSLog("FA_DRAG: activated drag on %@", NSStringFromClass(type(of: dataSource))) }
+                }
             }
         }
 
@@ -162,14 +181,14 @@ struct TableDragBridge: NSViewRepresentable {
         /// `canDragRows(with:at:)` (confirmed via FA_DRAG_DEBUG method
         /// introspection) and, with no SwiftUI-level drag modifiers
         /// registered, answers false — gating drag initiation before the
-        /// dataSource is ever asked for a pasteboard writer, so the proxy
-        /// alone does nothing. This registers (once) a runtime subclass of
-        /// whatever class the instance actually is, overriding just that
-        /// one method to answer true, and isa-swizzles the instance onto
-        /// it. Per-instance, not class-global; if any step fails the
-        /// instance is left untouched and drag is simply inert — the click
-        /// path is native AppKit machinery either way and is never
-        /// affected.
+        /// dataSource is ever asked for a pasteboard writer, so the added
+        /// dataSource methods alone do nothing. This registers (once) a
+        /// runtime subclass of whatever class the instance actually is,
+        /// overriding just that one method to answer true, and
+        /// isa-swizzles the instance onto it. Per-instance, not
+        /// class-global; if any step fails the instance is left untouched
+        /// and drag is simply inert — the click path is native AppKit
+        /// machinery either way and is never affected.
         private static func allowRowDragging(on tableView: NSTableView) {
             let baseClass: AnyClass = object_getClass(tableView)!
             let subclassName = "FADraggable_" + NSStringFromClass(baseClass)
@@ -214,14 +233,19 @@ struct TableDragBridge: NSViewRepresentable {
 private let dragDebug = ProcessInfo.processInfo.environment["FA_DRAG_DEBUG"] == "1"
 /// Kill switch for outgoing drag (both views) — dev/testing aid, e.g. for
 /// A/B-ing whether a suspected interaction regression comes from the drag
-/// machinery at all.
+/// machinery at all. This is how the dataSource-proxy/right-click breakage
+/// described in the type doc comment was isolated.
 let dragDisabled = ProcessInfo.processInfo.environment["FA_NO_DRAG"] == "1"
+
+/// Associated-object key: each bridged `NSTableView` carries the
+/// `TableDragConfig` the class-level writer methods route through.
+private nonisolated(unsafe) var tableDragConfigKey: UInt8 = 0
 
 /// FA_DRAG_DEBUG only: reports which drag-related NSTableView methods
 /// SwiftUI's private subclass (or any class between it and NSTableView)
-/// overrides — that determines whether the dataSource proxy can work at
-/// all, or whether the subclass gates dragging before the dataSource is
-/// ever consulted.
+/// overrides — that determines whether adding dataSource drag methods can
+/// work at all, or whether the subclass gates dragging before the
+/// dataSource is ever consulted.
 @MainActor
 private func logDragMethodOverrides(of tableView: NSTableView) {
     let selectors: [Selector] = [
@@ -246,56 +270,99 @@ private func logDragMethodOverrides(of tableView: NSTableView) {
     }
 }
 
-/// Forwards everything to SwiftUI's own dataSource except
-/// `tableView(_:pasteboardWriterForRow:)`, which it adds. `original` is held
-/// strongly so it can't die between SwiftUI updates; when SwiftUI installs a
-/// new dataSource of its own, `Coordinator.reassert` re-wraps that one and
-/// this reference is released.
-///
-/// `nonisolated(unsafe)` because `forwardingTarget`/`responds` are
-/// nonisolated `NSObject` overrides — AppKit only ever calls dataSource
-/// methods on the main thread, and the drag closures hop through
-/// `MainActor.assumeIsolated` before touching any SwiftUI state.
-final class DragDataSourceProxy: NSObject, NSTableViewDataSource, NSOutlineViewDataSource {
-    nonisolated(unsafe) var original: (any NSTableViewDataSource)?
-    nonisolated(unsafe) var urlForRow: @MainActor (Int) -> URL? = { _ in nil }
-    nonisolated(unsafe) var canDrag: @MainActor () -> Bool = { false }
+/// Per-table drag closures, attached to the backing table view as an
+/// associated object. The pasteboard-writer methods this type installs on
+/// SwiftUI's coordinator CLASS are shared by every table whose dataSource
+/// is that class (both panes); routing per table goes through this object.
+@MainActor
+final class TableDragConfig: NSObject {
+    var urlForRow: @MainActor (Int) -> URL? = { _ in nil }
+    var canDrag: @MainActor () -> Bool = { false }
 
-    override func forwardingTarget(for aSelector: Selector!) -> Any? {
-        original
-    }
-
-    override func responds(to aSelector: Selector!) -> Bool {
-        super.responds(to: aSelector) || (original?.responds(to: aSelector) ?? false)
-    }
-
-    /// SwiftUI's `Table` is actually backed by an `NSOutlineView` subclass
-    /// (`SwiftUIOutlineTableView`, confirmed via FA_DRAG_DEBUG logging), so
-    /// drag initiation consults this outline-flavored method — the item is
-    /// SwiftUI's opaque internal row object, mapped back to a flat row
-    /// index via `row(forItem:)`. The plain `NSTableView` variant below is
-    /// kept as a fallback in case a future macOS switches the backing view.
-    func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForItem item: Any) -> (any NSPasteboardWriting)? {
-        writer(forRow: outlineView.row(forItem: item))
-    }
-
-    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> (any NSPasteboardWriting)? {
-        writer(forRow: row)
-    }
-
-    private func writer(forRow row: Int) -> (any NSPasteboardWriting)? {
-        guard row >= 0 else { return nil }
-        let canDrag = self.canDrag
-        let urlForRow = self.urlForRow
-        // `assumeIsolated` can't return the non-Sendable NSPasteboardWriting
-        // directly — hand it out through an unsafe box instead. Safe because
-        // the whole call runs synchronously on the main thread.
-        nonisolated(unsafe) var writer: (any NSPasteboardWriting)?
+    fileprivate nonisolated static func writer(for tableView: NSTableView, row: Int) -> AnyObject? {
+        // The ObjC-called blocks below are nonisolated; AppKit only ever
+        // calls dataSource methods on the main thread, and
+        // `assumeIsolated` can't return the non-Sendable writer directly —
+        // hand it out through an unsafe box instead.
+        nonisolated(unsafe) var result: AnyObject?
         MainActor.assumeIsolated {
             if dragDebug { NSLog("FA_DRAG: pasteboardWriter for row %d", row) }
-            guard canDrag() else { return }
-            writer = urlForRow(row).map { $0 as NSURL }
+            guard row >= 0,
+                  let config = objc_getAssociatedObject(tableView, &tableDragConfigKey) as? TableDragConfig,
+                  config.canDrag()
+            else { return }
+            result = config.urlForRow(row).map { $0 as NSURL }
         }
-        return writer
+        return result
     }
+
+    /// Installs `outlineView(_:pasteboardWriterForItem:)` (SwiftUI's
+    /// `Table` is backed by an `NSOutlineView` subclass, confirmed via
+    /// FA_DRAG_DEBUG logging, so drag initiation consults the
+    /// outline-flavored method; the item is SwiftUI's opaque internal row
+    /// object, mapped back to a flat row index via `row(forItem:)`) and the
+    /// plain `tableView(_:pasteboardWriterForRow:)` variant (kept in case a
+    /// future macOS switches the backing view) directly onto SwiftUI's own
+    /// coordinator class — see the `TableDragBridge` doc comment for why
+    /// the dataSource object itself must NOT be wrapped or replaced
+    /// (identity-checked by the `.contextMenu` path).
+    ///
+    /// The coordinator class already implements the outline-flavored method
+    /// natively (confirmed: `class_addMethod` returns false for it, true
+    /// for the table-flavored one), presumably answering nil when no
+    /// SwiftUI-level drag modifiers are registered — so plain
+    /// `class_addMethod` alone leaves drag inert. When adding fails, the
+    /// existing implementation is swapped via `method_setImplementation`:
+    /// our writer is consulted first, and any table without a
+    /// `TableDragConfig` (nil writer) falls through to SwiftUI's original
+    /// implementation, preserving stock behavior everywhere else.
+    @MainActor
+    fileprivate static func installWriterMethods(onClassOf dataSource: AnyObject) {
+        let cls: AnyClass = object_getClass(dataSource)!
+        guard !installedClasses.contains(ObjectIdentifier(cls)) else { return }
+        installedClasses.insert(ObjectIdentifier(cls))
+
+        let outlineSel = NSSelectorFromString("outlineView:pasteboardWriterForItem:")
+        typealias OutlineFn = @convention(c) (AnyObject, Selector, NSOutlineView, AnyObject) -> AnyObject?
+        let outlineOriginal = IMPBox()
+        let outlineBlock: @convention(block) (AnyObject, NSOutlineView, AnyObject) -> AnyObject? = { target, outlineView, item in
+            nonisolated(unsafe) var row = -1
+            MainActor.assumeIsolated { row = outlineView.row(forItem: item) }
+            if let ours = writer(for: outlineView, row: row) { return ours }
+            guard let imp = outlineOriginal.imp else { return nil }
+            return unsafeBitCast(imp, to: OutlineFn.self)(target, outlineSel, outlineView, item)
+        }
+        install(outlineSel, imp_implementationWithBlock(outlineBlock), types: "@@:@@", on: cls, saving: outlineOriginal)
+
+        let tableSel = NSSelectorFromString("tableView:pasteboardWriterForRow:")
+        typealias TableFn = @convention(c) (AnyObject, Selector, NSTableView, Int) -> AnyObject?
+        let tableOriginal = IMPBox()
+        let tableBlock: @convention(block) (AnyObject, NSTableView, Int) -> AnyObject? = { target, tableView, row in
+            if let ours = writer(for: tableView, row: row) { return ours }
+            guard let imp = tableOriginal.imp else { return nil }
+            return unsafeBitCast(imp, to: TableFn.self)(target, tableSel, tableView, row)
+        }
+        install(tableSel, imp_implementationWithBlock(tableBlock), types: "@@:@q", on: cls, saving: tableOriginal)
+    }
+
+    @MainActor
+    private static func install(_ sel: Selector, _ imp: IMP, types: String, on cls: AnyClass, saving box: IMPBox) {
+        if class_addMethod(cls, sel, imp, types) {
+            if dragDebug { NSLog("FA_DRAG: added %@ on %@", NSStringFromSelector(sel), NSStringFromClass(cls)) }
+        } else if let method = class_getInstanceMethod(cls, sel) {
+            box.imp = method_setImplementation(method, imp)
+            if dragDebug { NSLog("FA_DRAG: wrapped existing %@ on %@", NSStringFromSelector(sel), NSStringFromClass(cls)) }
+        } else if dragDebug {
+            NSLog("FA_DRAG: could not install %@ on %@", NSStringFromSelector(sel), NSStringFromClass(cls))
+        }
+    }
+
+    /// Reference box for the pre-swap IMP: the replacement block must be
+    /// built (to get its IMP) before `method_setImplementation` can return
+    /// the original, so the block reads it through this indirection.
+    private final class IMPBox {
+        nonisolated(unsafe) var imp: IMP?
+    }
+
+    @MainActor private static var installedClasses = Set<ObjectIdentifier>()
 }
