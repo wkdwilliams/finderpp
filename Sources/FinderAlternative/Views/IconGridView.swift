@@ -6,8 +6,10 @@ struct IconGridView: View {
     @EnvironmentObject private var coordinator: FileOperationCoordinator
     @EnvironmentObject private var settings: AppSettings
     @State private var anchorID: FileItem.ID?
-    @State private var renamingID: FileItem.ID?
-    @State private var draftName: String = ""
+    /// See `RenameState` — shared with `FileListView` so both views have
+    /// one set of rename semantics.
+    @StateObject private var rename = RenameState()
+    @FocusState private var isRenameFieldFocused: Bool
     @State private var pendingCompressItems: [FileItem]?
     /// Manual double-click detection state — see `selectOnly`'s doc comment
     /// for why this replaces a competing `TapGesture(count: 2)`.
@@ -65,9 +67,11 @@ struct IconGridView: View {
                                 viewModel: viewModel,
                                 coordinator: coordinator
                             ) { renamedItem in
-                                beginRenaming(renamedItem)
+                                rename.begin(renamedItem)
                             } onCompress: { items in
                                 pendingCompressItems = items
+                            } onError: { message in
+                                rename.errorMessage = message
                             }
                         }
                 }
@@ -81,18 +85,30 @@ struct IconGridView: View {
             registry: frameRegistry,
             payloadURLs: { hitID in dragPayloadURLs(hitID: hitID, viewModel: viewModel) },
             selectOnPress: { hitID in
+                // Finder's click-a-selected-cell-again-to-rename trigger.
+                // Decided here, at press time, because the selection write
+                // below would otherwise make every cell look "already
+                // selected" by the time the mouse-up tap gesture runs.
+                if let hitID, viewModel.selection == [hitID],
+                   let item = viewModel.filteredItems.first(where: { $0.id == hitID }) {
+                    rename.scheduleFromClick(on: item)
+                } else {
+                    rename.cancelPending()
+                }
                 // Finder parity: pressing an unselected cell selects just
                 // it immediately (at mouse-down, not release — the
                 // TapGesture's on-release selection alone reads as lag).
-                if !viewModel.selection.contains(hitID) {
+                if let hitID, !viewModel.selection.contains(hitID) {
                     viewModel.selection = [hitID]
                     anchorID = hitID
                 }
             },
-            canDrag: { renamingID == nil && !coordinator.isBlocking }
+            canDrag: { !rename.isRenaming && !coordinator.isBlocking }
         ))
         .onChange(of: viewModel.currentDirectory) {
             frameRegistry.clear()
+            // A directory change disarms a pending click-to-rename.
+            rename.cancel()
         }
         // Grid-level drop target — drops into currentDirectory regardless of
         // which cell they land on. Incoming drops (from Finder or the other
@@ -102,15 +118,29 @@ struct IconGridView: View {
             return true
         }
         .onKeyPress(.return) {
-            guard renamingID == nil, viewModel.selection.count == 1,
+            guard !rename.isRenaming, viewModel.selection.count == 1,
                   let item = viewModel.selectedItems.first else { return .ignored }
-            beginRenaming(item)
+            rename.begin(item)
             return .handled
         }
+        // Safety net for the paths where the field never took focus — see
+        // `FileListView`'s equivalent.
+        .onChange(of: viewModel.selection) { _, selection in
+            rename.cancelPending()
+            if let id = rename.renamingID, !selection.contains(id) { rename.cancel() }
+        }
         .onKeyPress(.space) {
-            guard renamingID == nil, !viewModel.selectedItems.isEmpty else { return .ignored }
+            guard !rename.isRenaming, !viewModel.selectedItems.isEmpty else { return .ignored }
             QuickLookCoordinator.shared.toggle(for: viewModel.selectedItems.map(\.url))
             return .handled
+        }
+        .alert("Couldn’t Rename", isPresented: Binding(
+            get: { rename.errorMessage != nil },
+            set: { if !$0 { rename.errorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { rename.errorMessage = nil }
+        } message: {
+            Text(rename.errorMessage ?? "")
         }
         .confirmationDialog(
             "Delete \(viewModel.pendingPermanentDelete.count) item\(viewModel.pendingPermanentDelete.count == 1 ? "" : "s") permanently?",
@@ -172,7 +202,12 @@ struct IconGridView: View {
         lastClickedID = item.id
         lastClickTime = now
 
+        // Deliberately does NOT touch a pending click-to-rename except to
+        // kill it on a double-click: the press handler in `GridDragMonitor`
+        // owns arming it, and this runs on mouse-*up* of the very same
+        // click, so cancelling here would disarm every trigger instantly.
         if isDoubleClick {
+            rename.cancelPending()
             viewModel.open(item, coordinator: coordinator)
             return
         }
@@ -217,12 +252,27 @@ struct IconGridView: View {
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 .frame(width: 38 * viewerScale, height: 38 * viewerScale)
-            if renamingID == item.id {
-                TextField("Name", text: $draftName)
+            if rename.renamingID == item.id {
+                TextField("Name", text: $rename.draftName)
                     .font(.system(size: 10 * viewerScale))
                     .multilineTextAlignment(.center)
+                    .focused($isRenameFieldFocused)
                     .onSubmit { commitRename(item) }
-                    .onKeyPress(.escape) { renamingID = nil; return .handled }
+                    .onKeyPress(.escape) { rename.cancel(); return .handled }
+                    // See `FileListView.nameCell` — focus has to be taken one
+                    // run-loop turn after the field exists, not in
+                    // `beginRenaming`.
+                    .onAppear {
+                        DispatchQueue.main.async {
+                            isRenameFieldFocused = true
+                            RenameState.selectBaseName(of: rename.draftName)
+                        }
+                    }
+                    // Clicking away ends the rename instead of leaving the
+                    // cell stuck in edit mode — see `FileListView.NameCell`.
+                    .onChange(of: isRenameFieldFocused) { _, focused in
+                        if !focused, rename.renamingID == item.id { rename.cancel() }
+                    }
             } else {
                 Text(item.name)
                     .font(.system(size: 10 * viewerScale))
@@ -238,19 +288,16 @@ struct IconGridView: View {
         )
     }
 
-    private func beginRenaming(_ item: FileItem) {
-        draftName = item.name
-        renamingID = item.id
-    }
-
     private func commitRename(_ item: FileItem) {
-        defer { renamingID = nil }
+        let draftName = rename.draftName
+        defer { rename.cancel() }
         guard !draftName.isEmpty, draftName != item.name else { return }
         do {
             let renamed = try FileSystemService.rename(item.url, to: draftName)
             viewModel.reload()
             viewModel.selection = [renamed.path]
         } catch {
+            rename.errorMessage = RenameState.failureMessage(from: item.name, to: draftName, error: error)
             viewModel.reload()
         }
     }

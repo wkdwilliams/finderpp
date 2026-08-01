@@ -33,7 +33,11 @@ final class FlippedAnchorView: NSView {
 struct GridDragMonitor: NSViewRepresentable {
     let registry: CellFrameRegistry
     var payloadURLs: @MainActor (FileItem.ID) -> [URL]
-    var selectOnPress: @MainActor (FileItem.ID) -> Void
+    /// Called on every plain press inside the grid — with the pressed cell,
+    /// or `nil` for a press on empty space. Runs *before* any selection is
+    /// written, which is what lets the view tell whether the pressed cell
+    /// was already selected (Finder's click-again-to-rename trigger).
+    var selectOnPress: @MainActor (FileItem.ID?) -> Void
     var canDrag: @MainActor () -> Bool
 
     func makeNSView(context: Context) -> FlippedAnchorView {
@@ -59,7 +63,7 @@ struct GridDragMonitor: NSViewRepresentable {
     final class Coordinator {
         var registry: CellFrameRegistry?
         var payloadURLs: @MainActor (FileItem.ID) -> [URL] = { _ in [] }
-        var selectOnPress: @MainActor (FileItem.ID) -> Void = { _ in }
+        var selectOnPress: @MainActor (FileItem.ID?) -> Void = { _ in }
         var canDrag: @MainActor () -> Bool = { false }
 
         private weak var anchor: FlippedAnchorView?
@@ -101,9 +105,11 @@ struct GridDragMonitor: NSViewRepresentable {
                       event.modifierFlags.intersection([.command, .shift, .control]).isEmpty
                 else { return }
                 let point = anchor.convert(event.locationInWindow, from: nil)
-                guard anchor.bounds.contains(point),
-                      let hitID = registry?.frames.first(where: { $0.value.contains(point) })?.key
-                else { return }
+                guard anchor.bounds.contains(point) else { return }
+                guard let hitID = registry?.frames.first(where: { $0.value.contains(point) })?.key else {
+                    selectOnPress(nil)
+                    return
+                }
                 // Select at press time, not on release: the TapGesture's
                 // `.onEnded` only fires at mouse-up, which reads as click
                 // lag. Pure state write — the event still flows through

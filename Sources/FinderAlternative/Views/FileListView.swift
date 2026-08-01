@@ -5,8 +5,8 @@ struct FileListView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     @EnvironmentObject private var coordinator: FileOperationCoordinator
     @EnvironmentObject private var settings: AppSettings
-    @State private var renamingID: FileItem.ID?
-    @State private var draftName: String = ""
+    /// See `RenameState` for why this isn't plain `@State`.
+    @StateObject private var rename = RenameState()
     @State private var pendingCompressItems: [FileItem]?
     /// See `AppSettings`'s doc comment for why this is `.environmentObject`
     /// rather than `@AppStorage` directly.
@@ -56,7 +56,7 @@ struct FileListView: View {
             urlForRow: { row in
                 viewModel.filteredItems.indices.contains(row) ? viewModel.filteredItems[row].url : nil
             },
-            canDrag: { renamingID == nil && !coordinator.isBlocking },
+            canDrag: { !rename.isRenaming && !coordinator.isBlocking },
             selectRow: { row in
                 guard viewModel.filteredItems.indices.contains(row) else { return }
                 let id = viewModel.filteredItems[row].id
@@ -67,25 +67,47 @@ struct FileListView: View {
                 if !viewModel.selection.contains(id) {
                     viewModel.selection = [id]
                 }
+            },
+            // Finder's click-a-selected-row-again-to-rename trigger. Runs
+            // before `selectRow`, so `viewModel.selection` still holds what
+            // was selected *before* this click.
+            pressedRow: { row, clickCount in
+                rename.cancelPending()
+                guard clickCount == 1, viewModel.filteredItems.indices.contains(row) else { return }
+                let item = viewModel.filteredItems[row]
+                guard viewModel.selection == [item.id] else { return }
+                rename.scheduleFromClick(on: item)
             }
         ))
         .contextMenu(forSelectionType: FileItem.ID.self) { ids in
             fileContextMenu(for: ids, viewModel: viewModel, coordinator: coordinator) { item in
-                beginRenaming(item)
+                rename.begin(item)
             } onCompress: { items in
                 pendingCompressItems = items
+            } onError: { message in
+                rename.errorMessage = message
             }
         } primaryAction: { ids in
             openItems(ids)
         }
         .onKeyPress(.return) {
-            guard renamingID == nil, viewModel.selection.count == 1,
+            guard !rename.isRenaming, viewModel.selection.count == 1,
                   let item = viewModel.selectedItems.first else { return .ignored }
-            beginRenaming(item)
+            rename.begin(item)
             return .handled
         }
+        // Safety net for the same stuck-rename problem as the field's
+        // focus watcher, for the paths where the field never took focus
+        // to begin with (window not key, focus stolen by another pane).
+        .onChange(of: viewModel.selection) { _, selection in
+            rename.cancelPending()
+            if let id = rename.renamingID, !selection.contains(id) { rename.cancel() }
+        }
+        // Keyboard navigation, a directory change, or anything else that
+        // moves the ground under a pending click-to-rename disarms it.
+        .onChange(of: viewModel.currentDirectory) { rename.cancel() }
         .onKeyPress(.space) {
-            guard renamingID == nil, !viewModel.selectedItems.isEmpty else { return .ignored }
+            guard !rename.isRenaming, !viewModel.selectedItems.isEmpty else { return .ignored }
             QuickLookCoordinator.shared.toggle(for: viewModel.selectedItems.map(\.url))
             return .handled
         }
@@ -97,6 +119,14 @@ struct FileListView: View {
         .dropDestination(for: URL.self) { urls, _ in
             performDrop(urls: urls, destination: viewModel.currentDirectory, viewModel: viewModel, coordinator: coordinator)
             return true
+        }
+        .alert("Couldn’t Rename", isPresented: Binding(
+            get: { rename.errorMessage != nil },
+            set: { if !$0 { rename.errorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { rename.errorMessage = nil }
+        } message: {
+            Text(rename.errorMessage ?? "")
         }
         .confirmationDialog(
             "Delete \(viewModel.pendingPermanentDelete.count) item\(viewModel.pendingPermanentDelete.count == 1 ? "" : "s") permanently?",
@@ -165,57 +195,21 @@ struct FileListView: View {
     /// interposes the backing `NSTableView`'s dataSource so AppKit's own
     /// native click-vs-drag machinery runs instead — see that type's doc
     /// comment. Do not reintroduce `.draggable`/`.onDrag` here.
-    @ViewBuilder
     private func nameCell(for item: FileItem) -> some View {
-        if renamingID == item.id {
-            TextField("Name", text: $draftName)
-                .textFieldStyle(.plain)
-                .font(.system(size: 11 * viewerScale))
-                .onSubmit { commitRename(item) }
-                .onKeyPress(.escape) { renamingID = nil; return .handled }
-        } else {
-            HStack(spacing: 4) {
-                icon(for: item)
-                Text(item.name)
-            }
-            .font(.system(size: 11 * viewerScale, weight: .bold))
+        NameCell(item: item, rename: rename, scale: viewerScale) { newName in
+            commitRename(item, to: newName)
         }
     }
 
-    /// Folders keep the plain SF Symbol — files get the real icon macOS
-    /// resolves for that file (`NSWorkspace.icon(forFile:)`, same as
-    /// `IconGridView`): the icon of whatever app is registered to open it,
-    /// e.g. an `.mp4` shows VLC's icon if VLC is the default player,
-    /// instead of one generic document placeholder for every file type.
-    @ViewBuilder
-    private func icon(for item: FileItem) -> some View {
-        Group {
-            if item.isDirectory {
-                Image(systemName: "folder")
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-            } else {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: item.url.path))
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-            }
-        }
-        .frame(width: 14 * viewerScale, height: 14 * viewerScale)
-    }
-
-    private func beginRenaming(_ item: FileItem) {
-        draftName = item.name
-        renamingID = item.id
-    }
-
-    private func commitRename(_ item: FileItem) {
-        defer { renamingID = nil }
-        guard !draftName.isEmpty, draftName != item.name else { return }
+    private func commitRename(_ item: FileItem, to newName: String) {
+        defer { rename.cancel() }
+        guard !newName.isEmpty, newName != item.name else { return }
         do {
-            let renamed = try FileSystemService.rename(item.url, to: draftName)
+            let renamed = try FileSystemService.rename(item.url, to: newName)
             viewModel.reload()
             viewModel.selection = [renamed.path]
         } catch {
+            rename.errorMessage = RenameState.failureMessage(from: item.name, to: newName, error: error)
             viewModel.reload()
         }
     }
@@ -236,5 +230,74 @@ struct FileListView: View {
     private func dateString(for item: FileItem) -> String {
         guard let date = item.modificationDate else { return "--" }
         return date.formatted(date: .abbreviated, time: .shortened)
+    }
+}
+
+/// A real `View` (not a `@ViewBuilder` method on `FileListView`) so it can
+/// hold `@ObservedObject`/`@FocusState` of its own — that observation is
+/// what makes the cell swap to the rename field, since `Table` won't re-run
+/// the column's cell closure for an unchanged row. See `RenameState`.
+private struct NameCell: View {
+    let item: FileItem
+    @ObservedObject var rename: RenameState
+    let scale: Double
+    let onCommit: (String) -> Void
+    @FocusState private var isFieldFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 4) {
+            icon
+            if rename.renamingID == item.id {
+                TextField("Name", text: $rename.draftName)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11 * scale))
+                    .focused($isFieldFocused)
+                    .onSubmit { onCommit(rename.draftName) }
+                    .onKeyPress(.escape) { rename.cancel(); return .handled }
+                    // The field doesn't exist yet when the rename starts, and
+                    // the context menu is still tearing down its own
+                    // first-responder state in that frame — taking focus one
+                    // run-loop turn after the field is real is what actually
+                    // makes it editable.
+                    .onAppear {
+                        DispatchQueue.main.async {
+                            isFieldFocused = true
+                            RenameState.selectBaseName(of: rename.draftName)
+                        }
+                    }
+                    // Clicking away (another row, another pane, the toolbar)
+                    // ends the rename instead of leaving the row stuck in
+                    // edit mode — otherwise the field is still armed when the
+                    // row is clicked again later and rename re-triggers itself
+                    // out of nowhere.
+                    .onChange(of: isFieldFocused) { _, focused in
+                        if !focused, rename.renamingID == item.id { rename.cancel() }
+                    }
+            } else {
+                Text(item.name)
+                    .font(.system(size: 11 * scale, weight: .bold))
+            }
+        }
+    }
+
+    /// Folders keep the plain SF Symbol — files get the real icon macOS
+    /// resolves for that file (`NSWorkspace.icon(forFile:)`, same as
+    /// `IconGridView`): the icon of whatever app is registered to open it,
+    /// e.g. an `.mp4` shows VLC's icon if VLC is the default player,
+    /// instead of one generic document placeholder for every file type.
+    @ViewBuilder
+    private var icon: some View {
+        Group {
+            if item.isDirectory {
+                Image(systemName: "folder")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: item.url.path))
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            }
+        }
+        .frame(width: 14 * scale, height: 14 * scale)
     }
 }

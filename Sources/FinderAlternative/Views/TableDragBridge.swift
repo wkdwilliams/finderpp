@@ -53,6 +53,11 @@ struct TableDragBridge: NSViewRepresentable {
     /// selection — a pure state write; the event itself is never consumed,
     /// so the click-safety invariant of this whole file still holds.
     var selectRow: @MainActor (Int) -> Void
+    /// Called on the same plain mouseDown, *before* `selectRow`, with the
+    /// row and the event's click count — so the view can still see which
+    /// rows were selected before this click (what Finder's
+    /// click-a-selected-item-again rename trigger keys off).
+    var pressedRow: @MainActor (Int, Int) -> Void
 
     func makeNSView(context: Context) -> NSView {
         let anchor = NSView()
@@ -72,6 +77,7 @@ struct TableDragBridge: NSViewRepresentable {
         context.coordinator.config.urlForRow = urlForRow
         context.coordinator.config.canDrag = canDrag
         context.coordinator.selectRow = selectRow
+        context.coordinator.pressedRow = pressedRow
         context.coordinator.canDrag = canDrag
         context.coordinator.reassert(from: nsView)
     }
@@ -86,6 +92,7 @@ struct TableDragBridge: NSViewRepresentable {
     final class Coordinator {
         let config = TableDragConfig()
         var selectRow: @MainActor (Int) -> Void = { _ in }
+        var pressedRow: @MainActor (Int, Int) -> Void = { _, _ in }
         var canDrag: @MainActor () -> Bool = { false }
         private weak var tableView: NSTableView?
         private var pressMonitor: Any?
@@ -123,6 +130,7 @@ struct TableDragBridge: NSViewRepresentable {
             if tableView.window?.firstResponder !== tableView {
                 tableView.window?.makeFirstResponder(tableView)
             }
+            pressedRow(row, event.clickCount)
             selectRow(row)
         }
 

@@ -332,6 +332,25 @@ enum FileSystemService {
         return destination
     }
 
+    /// Finder's own default names for new items, numbered on collision
+    /// ("untitled folder", "untitled folder 2", …).
+    @discardableResult
+    static func createDirectory(named name: String = "untitled folder", in directory: URL) throws -> URL {
+        let url = uniqueDestinationURL(forFilename: name, in: directory)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+        return url
+    }
+
+    @discardableResult
+    static func createFile(named name: String = "untitled file", in directory: URL) throws -> URL {
+        let url = uniqueDestinationURL(forFilename: name, in: directory)
+        guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+            // `createFile` reports failure as a plain false with no error.
+            throw CocoaError(.fileWriteUnknown)
+        }
+        return url
+    }
+
     @discardableResult
     static func createSymbolicLink(for url: URL, in directory: URL) throws -> URL {
         let linkURL = uniqueDestinationURL(for: url, in: directory)
