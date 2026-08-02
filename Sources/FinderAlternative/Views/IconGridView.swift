@@ -9,6 +9,8 @@ struct IconGridView: View {
     /// See `RenameState` — shared with `FileListView` so both views have
     /// one set of rename semantics.
     @StateObject private var rename = RenameState()
+    /// See `DropTargetState`.
+    @StateObject private var dropTarget = DropTargetState()
     @FocusState private var isRenameFieldFocused: Bool
     @State private var pendingCompressItems: [FileItem]?
     /// Manual double-click detection state — see `selectOnly`'s doc comment
@@ -50,6 +52,9 @@ struct IconGridView: View {
             LazyVGrid(columns: columns, spacing: 12 * viewerScale) {
                 ForEach(viewModel.filteredItems) { item in
                     cell(for: item)
+                        .folderDropTarget(item, state: dropTarget) { urls in
+                            performDrop(urls: urls, destination: item.url, viewModel: viewModel, coordinator: coordinator)
+                        }
                         .onGeometryChange(for: CGRect.self) { proxy in
                             proxy.frame(in: .named("gridSpace"))
                         } action: { frame in
@@ -127,7 +132,7 @@ struct IconGridView: View {
         // `FileListView`'s equivalent.
         .onChange(of: viewModel.selection) { _, selection in
             rename.cancelPending()
-            if let id = rename.renamingID, !selection.contains(id) { rename.cancel() }
+            if let id = rename.renamingID, !selection.contains(id) { rename.commit() }
         }
         .onKeyPress(.space) {
             guard !rename.isRenaming, !viewModel.selectedItems.isEmpty else { return .ignored }
@@ -257,21 +262,23 @@ struct IconGridView: View {
                     .font(.system(size: 10 * viewerScale))
                     .multilineTextAlignment(.center)
                     .focused($isRenameFieldFocused)
-                    .onSubmit { commitRename(item) }
+                    .onSubmit { rename.commit() }
                     .onKeyPress(.escape) { rename.cancel(); return .handled }
                     // See `FileListView.nameCell` — focus has to be taken one
                     // run-loop turn after the field exists, not in
                     // `beginRenaming`.
                     .onAppear {
+                        rename.onCommit = { newName in commitRename(item, to: newName) }
                         DispatchQueue.main.async {
                             isRenameFieldFocused = true
                             RenameState.selectBaseName(of: rename.draftName)
                         }
                     }
                     // Clicking away ends the rename instead of leaving the
-                    // cell stuck in edit mode — see `FileListView.NameCell`.
+                    // cell stuck in edit mode, and *commits* the typed name
+                    // the way Finder does — see `RenameState.commit`.
                     .onChange(of: isRenameFieldFocused) { _, focused in
-                        if !focused, rename.renamingID == item.id { rename.cancel() }
+                        if !focused, rename.renamingID == item.id { rename.commit() }
                     }
             } else {
                 Text(item.name)
@@ -284,20 +291,32 @@ struct IconGridView: View {
         .frame(width: 78 * viewerScale)
         .background(
             RoundedRectangle(cornerRadius: 6)
-                .fill(viewModel.selection.contains(item.id) ? Color.accentColor.opacity(0.25) : Color.clear)
+                .fill(cellBackground(for: item))
         )
     }
 
-    private func commitRename(_ item: FileItem) {
-        let draftName = rename.draftName
+    /// Drop-into-folder feedback wins over the selection highlight — while a
+    /// drag is over a folder, what matters is where it will land.
+    private func cellBackground(for item: FileItem) -> Color {
+        if dropTarget.targetID == item.id { return Color.accentColor.opacity(0.45) }
+        return viewModel.selection.contains(item.id) ? Color.accentColor.opacity(0.25) : Color.clear
+    }
+
+    private func commitRename(_ item: FileItem, to newName: String) {
         defer { rename.cancel() }
-        guard !draftName.isEmpty, draftName != item.name else { return }
+        guard !newName.isEmpty, newName != item.name else { return }
+        // See `FileListView.commitRename` — a click-away commit must leave
+        // the newly clicked cell selected, not jump back to this one.
+        let followsRenamedItem = viewModel.selection == [item.id]
         do {
-            let renamed = try FileSystemService.rename(item.url, to: draftName)
+            let renamed = try FileSystemService.rename(item.url, to: newName)
             viewModel.reload()
-            viewModel.selection = [renamed.path]
+            if followsRenamedItem {
+                viewModel.selection = [renamed.path]
+                anchorID = renamed.path
+            }
         } catch {
-            rename.errorMessage = RenameState.failureMessage(from: item.name, to: draftName, error: error)
+            rename.errorMessage = RenameState.failureMessage(from: item.name, to: newName, error: error)
             viewModel.reload()
         }
     }

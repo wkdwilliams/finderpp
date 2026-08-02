@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 /// Shared by `FileListView` and `IconGridView` — incoming-drop handling for
 /// both views, so it exists in one place instead of two drifting copies.
@@ -31,6 +32,60 @@ func urlsEligibleForDrop(_ urls: [URL], into destination: URL) -> [URL] {
 /// row in the source pane.
 extension Notification.Name {
     static let fileDropOperationDidComplete = Notification.Name("FAFileDropOperationDidComplete")
+}
+
+/// Which row/cell a drag is hovering over, when that row is a folder that
+/// would receive the drop.
+///
+/// An `ObservableObject` rather than plain `@State` on the owning view for
+/// the same reason `RenameState` is: SwiftUI's `Table` builds each cell once
+/// per row value and caches it, so a `@State` flag on `FileListView` never
+/// reaches the cell that has to draw the highlight. The cell holds this as
+/// an `@ObservedObject` and invalidates itself.
+@MainActor
+final class DropTargetState: ObservableObject {
+    @Published var targetID: FileItem.ID?
+}
+
+extension View {
+    /// Makes this row/cell accept a drop *into* `item`, so a file can be
+    /// moved into a folder shown in the same pane instead of only into the
+    /// pane's current directory (the pane-level `.dropDestination` both
+    /// views also carry).
+    ///
+    /// Attached only for real folders: on anything else the drop falls
+    /// through to that pane-level destination, which is Finder's behaviour
+    /// for dropping onto a file. `.app` bundles are excluded too — they're
+    /// directories on disk, but burying a dropped file inside one is never
+    /// what's meant (see `FileItem.isApplicationBundle`).
+    ///
+    /// The condition is a property of the path, so it can't flip for a given
+    /// row and the branch never changes a cell's view identity mid-gesture —
+    /// the failure mode that made conditional `.draggable` unusable here
+    /// (see `FileListView.nameCell`). `.dropDestination` was never part of
+    /// that problem: it takes no part in click handling at all.
+    @ViewBuilder
+    func folderDropTarget(
+        _ item: FileItem,
+        state: DropTargetState,
+        perform: @escaping ([URL]) -> Void
+    ) -> some View {
+        if item.isDirectory, !item.isApplicationBundle {
+            dropDestination(for: URL.self) { urls, _ in
+                state.targetID = nil
+                perform(urls)
+                return true
+            } isTargeted: { isTargeted in
+                if isTargeted {
+                    state.targetID = item.id
+                } else if state.targetID == item.id {
+                    state.targetID = nil
+                }
+            }
+        } else {
+            self
+        }
+    }
 }
 
 /// Same-volume drag = move, cross-volume = copy — matches Finder. A mixed

@@ -7,6 +7,8 @@ struct FileListView: View {
     @EnvironmentObject private var settings: AppSettings
     /// See `RenameState` for why this isn't plain `@State`.
     @StateObject private var rename = RenameState()
+    /// See `DropTargetState` — same cell-caching reason.
+    @StateObject private var dropTarget = DropTargetState()
     @State private var pendingCompressItems: [FileItem]?
     /// See `AppSettings`'s doc comment for why this is `.environmentObject`
     /// rather than `@AppStorage` directly.
@@ -39,14 +41,26 @@ struct FileListView: View {
 
     private var tableView: some View {
         Table(viewModel.filteredItems, selection: $viewModel.selection, sortOrder: sortOrderBinding) {
+            // Every column is a drop target for its row, so dropping onto a
+            // folder anywhere along the row moves the files into it — only
+            // the name cell draws the highlight.
             TableColumn("Name", value: \.name) { item in
                 nameCell(for: item)
+                    .folderDropTarget(item, state: dropTarget) { dropInto(item, urls: $0) }
             }
             TableColumn("Size", value: \.sortableSize) { item in
-                Text(sizeString(for: item)).font(.system(size: 11 * viewerScale, weight: .bold))
+                Text(sizeString(for: item))
+                    .font(.system(size: 11 * viewerScale, weight: .bold))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(.rect)
+                    .folderDropTarget(item, state: dropTarget) { dropInto(item, urls: $0) }
             }
             TableColumn("Modified", value: \.sortableModificationDate) { item in
-                Text(dateString(for: item)).font(.system(size: 11 * viewerScale, weight: .bold))
+                Text(dateString(for: item))
+                    .font(.system(size: 11 * viewerScale, weight: .bold))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(.rect)
+                    .folderDropTarget(item, state: dropTarget) { dropInto(item, urls: $0) }
             }
         }
         .controlSize(.small)
@@ -99,9 +113,11 @@ struct FileListView: View {
         // Safety net for the same stuck-rename problem as the field's
         // focus watcher, for the paths where the field never took focus
         // to begin with (window not key, focus stolen by another pane).
+        // Commits rather than discards, for the same reason the focus
+        // watcher does — see `RenameState.commit`.
         .onChange(of: viewModel.selection) { _, selection in
             rename.cancelPending()
-            if let id = rename.renamingID, !selection.contains(id) { rename.cancel() }
+            if let id = rename.renamingID, !selection.contains(id) { rename.commit() }
         }
         // Keyboard navigation, a directory change, or anything else that
         // moves the ground under a pending click-to-rename disarms it.
@@ -196,18 +212,29 @@ struct FileListView: View {
     /// native click-vs-drag machinery runs instead — see that type's doc
     /// comment. Do not reintroduce `.draggable`/`.onDrag` here.
     private func nameCell(for item: FileItem) -> some View {
-        NameCell(item: item, rename: rename, scale: viewerScale) { newName in
+        NameCell(item: item, rename: rename, dropTarget: dropTarget, scale: viewerScale) { newName in
             commitRename(item, to: newName)
         }
+    }
+
+    /// A drop onto a folder row, as opposed to the pane-level drop into
+    /// `currentDirectory`.
+    private func dropInto(_ folder: FileItem, urls: [URL]) {
+        performDrop(urls: urls, destination: folder.url, viewModel: viewModel, coordinator: coordinator)
     }
 
     private func commitRename(_ item: FileItem, to newName: String) {
         defer { rename.cancel() }
         guard !newName.isEmpty, newName != item.name else { return }
+        // A commit triggered by clicking a *different* file (Finder-style
+        // click-away-to-commit) must leave that file selected — only follow
+        // the renamed item when it's still what's selected, i.e. the rename
+        // ended via Return.
+        let followsRenamedItem = viewModel.selection == [item.id]
         do {
             let renamed = try FileSystemService.rename(item.url, to: newName)
             viewModel.reload()
-            viewModel.selection = [renamed.path]
+            if followsRenamedItem { viewModel.selection = [renamed.path] }
         } catch {
             rename.errorMessage = RenameState.failureMessage(from: item.name, to: newName, error: error)
             viewModel.reload()
@@ -240,11 +267,24 @@ struct FileListView: View {
 private struct NameCell: View {
     let item: FileItem
     @ObservedObject var rename: RenameState
+    @ObservedObject var dropTarget: DropTargetState
     let scale: Double
     let onCommit: (String) -> Void
     @FocusState private var isFieldFocused: Bool
 
     var body: some View {
+        cellContent
+            .padding(.horizontal, 3)
+            .padding(.vertical, 1)
+            // Finder's drop-into-folder feedback: the row being dropped on
+            // reads as a target before the mouse is released.
+            .background(
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(dropTarget.targetID == item.id ? Color.accentColor.opacity(0.35) : Color.clear)
+            )
+    }
+
+    private var cellContent: some View {
         HStack(spacing: 4) {
             icon
             if rename.renamingID == item.id {
@@ -252,7 +292,7 @@ private struct NameCell: View {
                     .textFieldStyle(.plain)
                     .font(.system(size: 11 * scale))
                     .focused($isFieldFocused)
-                    .onSubmit { onCommit(rename.draftName) }
+                    .onSubmit { rename.commit() }
                     .onKeyPress(.escape) { rename.cancel(); return .handled }
                     // The field doesn't exist yet when the rename starts, and
                     // the context menu is still tearing down its own
@@ -260,6 +300,7 @@ private struct NameCell: View {
                     // run-loop turn after the field is real is what actually
                     // makes it editable.
                     .onAppear {
+                        rename.onCommit = onCommit
                         DispatchQueue.main.async {
                             isFieldFocused = true
                             RenameState.selectBaseName(of: rename.draftName)
@@ -269,9 +310,10 @@ private struct NameCell: View {
                     // ends the rename instead of leaving the row stuck in
                     // edit mode — otherwise the field is still armed when the
                     // row is clicked again later and rename re-triggers itself
-                    // out of nowhere.
+                    // out of nowhere. It *commits* the typed name, the way
+                    // Finder does — see `RenameState.commit`.
                     .onChange(of: isFieldFocused) { _, focused in
-                        if !focused, rename.renamingID == item.id { rename.cancel() }
+                        if !focused, rename.renamingID == item.id { rename.commit() }
                     }
             } else {
                 Text(item.name)

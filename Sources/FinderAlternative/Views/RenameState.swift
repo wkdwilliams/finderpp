@@ -23,7 +23,14 @@ final class RenameState: ObservableObject {
     /// name silently snapping back to what it was.
     @Published var errorMessage: String?
 
+    /// Applies the typed name to the row under edit. Installed by the row
+    /// view that owns the field — it already closes over the right item, so
+    /// this type never has to track which one that is.
+    var onCommit: ((String) -> Void)?
+
     private var pending: DispatchWorkItem?
+    /// Non-nil between `commit()` and the deferred handler running.
+    private var committedName: String?
 
     var isRenaming: Bool { renamingID != nil }
 
@@ -31,11 +38,41 @@ final class RenameState: ObservableObject {
         cancelPending()
         draftName = item.name
         renamingID = item.id
+        RenameFieldEditor.isEditingFilename = true
+    }
+
+    /// Finder parity: every way of ending an inline rename EXCEPT Escape
+    /// keeps the typed name — Return, clicking another file, clicking
+    /// anywhere outside the field. Discarding on focus loss (what the field
+    /// used to do) made "type a new name, then click the next file" throw
+    /// the edit away silently, which is indistinguishable from rename being
+    /// broken; that was the reported "can't rename a folder".
+    ///
+    /// Editing state is cleared synchronously so no other end-of-edit path
+    /// can fire a second time for the same edit, but the handler itself is
+    /// deferred one run-loop turn: it reloads the pane, i.e. mutates the
+    /// `Table`'s data source, and the usual trigger is a click AppKit is
+    /// still dispatching (first-responder handoff) — the same reentrancy
+    /// that already produced an "Application performed a reentrant
+    /// operation in its NSTableView delegate" warning once in this project
+    /// (see `FileOperationCoordinator.runCompletionHandler`).
+    func commit() {
+        guard renamingID != nil else { return }
+        committedName = draftName
+        cancel()
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, let name = self.committedName else { return }
+                self.committedName = nil
+                self.onCommit?(name)
+            }
+        }
     }
 
     func cancel() {
         cancelPending()
         renamingID = nil
+        RenameFieldEditor.isEditingFilename = false
     }
 
     /// Finder/Explorer parity: clicking an already-selected item a second
@@ -104,6 +141,9 @@ final class RenameState: ObservableObject {
                 if retriesLeft > 0 { selectBaseName(of: name, retriesLeft: retriesLeft - 1) }
                 return
             }
+            // The only place the shared field editor is in hand — see
+            // `RenameFieldEditor` for what this installs and why here.
+            RenameFieldEditor.installFilenameWordSelection(on: editor)
             let full = name as NSString
             let base = full.deletingPathExtension
             // Dotfiles ("\.bashrc") have no base name to isolate — select
